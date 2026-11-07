@@ -96,6 +96,66 @@ class SafetyTest(unittest.TestCase):
         runs = self.history() + [{'id': 5, 'status': 'completed', 'created_at': '2026-10-24T01:00:00Z'}]
         self.assertFalse(module.previous_run_safe(runs, lambda _: [{'steps':[{'name':module.REQUEST_STEP,'conclusion':'failure'}]}], 2))
 
+    def test_rate_limit_deadline_survives_skipped_cooldown_runs(self):
+        runs = self.history() + [{'id': 3, 'status': 'completed', 'created_at': '2026-10-24T01:00:00Z'}]
+        def jobs(run_id):
+            steps = ([{'name':module.REQUEST_STEP,'conclusion':'skipped'}] if run_id == 3 else
+                     [{'name':module.REQUEST_STEP,'conclusion':'success'},
+                      {'name':module.RATE_LIMIT_MARKER+'2000000000','conclusion':'success'}])
+            return [{'steps':steps}]
+        self.assertEqual(module.previous_run_state(runs,jobs,9),(True,2000000000))
+
+    def test_skipped_run_cannot_conceal_uncertain_request(self):
+        runs = self.history() + [{'id': 3, 'status': 'completed', 'created_at': '2026-10-24T01:00:00Z'}]
+        jobs=lambda rid:[{'steps':[{'name':module.REQUEST_STEP,
+                                   'conclusion':'skipped' if rid == 3 else 'success'}]}]
+        self.assertFalse(module.previous_run_safe(runs,jobs,9))
+
+    def test_incomplete_or_malformed_rate_limit_marker_is_not_retry_permission(self):
+        for value,conclusion in [('2000000000','failure'),('garbage','success'),('','success')]:
+            self.assertFalse(self.safe([{'name':module.REQUEST_STEP,'conclusion':'success'},
+                                       {'name':module.RATE_LIMIT_MARKER+value,'conclusion':conclusion}]))
+
+    def test_rate_limit_cooldown_is_at_least_30_minutes_and_honors_retry_after(self):
+        for headers,expected in [({},2800),({'retry-after':'30'},2800),
+                                 ({'Retry-After':'3600'},4600),
+                                 ({'Retry-After':'Thu, 01 Jan 1970 02:00:00 GMT'},7200),
+                                 ({'retry-after':'invalid'},2800)]:
+            self.assertEqual(module.rate_limit_retry_at(headers,now=1000),expected)
+
+    def test_only_the_audited_legacy_rate_limit_can_resume(self):
+        run=dict(self.history()[0],id=int(module.REVIEWED_RATE_LIMIT_RUN),
+                 head_sha=module.REVIEWED_RATE_LIMIT_HEAD,conclusion='failure',run_attempt=1)
+        jobs=lambda _:[{'steps':[{'name':module.REQUEST_STEP,'conclusion':'success'},
+                                {'name':'Manual review required','conclusion':'failure'}]}]
+        self.assertTrue(module.previous_run_safe([run],jobs,9))
+        for changes in [{'id':42},{'head_sha':'other'},{'conclusion':'success'},{'run_attempt':2}]:
+            self.assertFalse(module.previous_run_safe([dict(run,**changes)],jobs,9))
+
+    def test_capacity_enforces_interval_for_adjacent_cron_and_dispatch(self):
+        jobs=lambda _:[{'steps':[{'name':module.REQUEST_STEP,'conclusion':'success'},
+            {'name':module.RETRY_MARKER,'conclusion':'success','completed_at':'1970-01-01T01:00:00Z'}]}]
+        self.assertEqual(module.previous_run_state(self.history(),jobs,9),(True,4200))
+
+    @patch.dict(os.environ,{'GITHUB_REPOSITORY':'owner/repo','GITHUB_RUN_ID':'9'})
+    def test_active_cooldown_makes_no_oci_calls(self):
+        def github(path):
+            if '/jobs?' in path:
+                return {'jobs':[{'steps':[{'name':module.REQUEST_STEP,'conclusion':'success'},
+                    {'name':module.RATE_LIMIT_MARKER+'2000000000','conclusion':'success'}]}]}
+            return {'workflow_runs':self.history()}
+        with patch.object(module,'github',side_effect=github), \
+             patch.object(module.time,'time',return_value=1999999999), \
+             patch.object(module,'clients') as clients, \
+             patch.object(module,'output') as output:
+            module.check()
+            output.assert_called_once_with(status='cooldown')
+            clients.assert_not_called()
+
+    def test_full_history_of_skipped_runs_fails_closed(self):
+        runs=[dict(self.history()[0],id=i) for i in range(100)]
+        self.assertFalse(module.previous_run_safe(runs,lambda _:[{'steps':[]}],999))
+
     @patch.object(module, 'SHAPE', 'VM.Standard.A1.Flex')
     @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root', 'AD_NAME':'ad', 'IMAGE_ID':'image',
                             'OCI_SUBNET_ID':'subnet', 'SSH_PUBLIC_KEY':'ssh-rsa public',
@@ -122,7 +182,7 @@ class SafetyTest(unittest.TestCase):
     @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root', 'AD_NAME':'ad', 'IMAGE_ID':'image',
                             'OCI_SUBNET_ID':'subnet', 'SSH_PUBLIC_KEY':'ssh-rsa public',
                             'GITHUB_REPOSITORY':'owner/repo'})
-    def test_only_explicit_capacity_allows_retry(self):
+    def test_only_explicit_capacity_and_rate_limit_allow_retry(self):
         for error, expected in [(oci.exceptions.ServiceError(500,'InternalError',{},'Out of host capacity.'),'capacity'),
                                 (oci.exceptions.ServiceError(401,'NotAuthenticated',{},'Authentication failed'),'uncertain'),
                                 (TimeoutError(),'uncertain')]:
@@ -133,6 +193,20 @@ class SafetyTest(unittest.TestCase):
                 module.launch()
                 output.assert_called_once_with(status=expected)
                 self.assertEqual(client.return_value.launch_instance.call_count,1)
+
+    @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root', 'AD_NAME':'ad', 'IMAGE_ID':'image',
+                            'OCI_SUBNET_ID':'subnet', 'SSH_PUBLIC_KEY':'ssh-rsa public',
+                            'GITHUB_REPOSITORY':'owner/repo'})
+    def test_launch_rate_limit_is_one_request_then_persisted_cooldown(self):
+        with patch.object(module,'load_config',return_value={}), \
+             patch.object(module.oci.core,'ComputeClient') as client, \
+             patch.object(module.time,'time',return_value=1000), \
+             patch.object(module,'output') as output:
+            client.return_value.launch_instance.side_effect=oci.exceptions.ServiceError(
+                429,'TooManyRequests',{'retry-after':'3600'},'User-rate limit exceeded.')
+            module.launch()
+            output.assert_called_once_with(status='rate_limited',retry_at=4600)
+            self.assertEqual(client.return_value.launch_instance.call_count,1)
 
 
 

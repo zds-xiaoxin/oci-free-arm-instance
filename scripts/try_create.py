@@ -1,9 +1,13 @@
 """One bounded OCI launch attempt; fail closed after an ambiguous previous run."""
 import hashlib
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 from pathlib import Path
 import sys
+import time
 import urllib.request
 
 import oci
@@ -18,6 +22,12 @@ REVIEWED_AMD_RUN = '40663927323'
 REVIEWED_AMD_HEAD = '4f2f67e09615fa0c8726bbc80fd7b9e5257faaa0'
 MARKER = 'oci-free-arm-instance'
 RETRY_MARKER = 'Safe to retry: capacity unavailable'
+RATE_LIMIT_MARKER = 'Safe to retry: rate limited until '
+RATE_LIMIT_COOLDOWN = 1800
+# Audited legacy run: its only launch returned HTTP 429 TooManyRequests.
+# OCI was re-listed before recovery; no ARM instance was accepted.
+REVIEWED_RATE_LIMIT_RUN = '41981028295'
+REVIEWED_RATE_LIMIT_HEAD = '83614b9d1b2cc09b8b2e7b64565e9e4c68eb0131'
 REQUEST_STEP = 'Request one instance'
 
 
@@ -56,24 +66,63 @@ def github(path):
         return json.load(response)
 
 
-def previous_run_safe(runs, jobs, current_run):
+def previous_run_state(runs, jobs, current_run):
     previous = [r for r in runs if str(r['id']) != str(current_run)
                 and r['status'] not in ('queued', 'waiting', 'pending', 'requested')]
-    if not previous:
-        return True
-    latest = max(previous, key=lambda r: r.get('run_started_at') or r['created_at'])
-    if latest['status'] != 'completed':
-        return False
-    if (str(latest['id']) == REVIEWED_AMD_RUN
-            and latest.get('head_sha') == REVIEWED_AMD_HEAD
-            and latest.get('conclusion') == 'success'):
-        return True
-    steps = [s for job in jobs(latest['id']) for s in job.get('steps', [])]
-    requests = [s for s in steps if s['name'] == REQUEST_STEP]
-    if not requests or all(s.get('conclusion') == 'skipped' for s in requests):
-        return True
-    return any(s['name'] == RETRY_MARKER and s.get('conclusion') == 'success'
-               for s in steps)
+    for latest in sorted(previous, key=lambda r: r.get('run_started_at') or r['created_at'], reverse=True):
+        if latest['status'] != 'completed':
+            return False, 0
+        if (str(latest['id']) == REVIEWED_AMD_RUN
+                and latest.get('head_sha') == REVIEWED_AMD_HEAD
+                and latest.get('conclusion') == 'success'):
+            return True, 0
+        steps = [s for job in jobs(latest['id']) for s in job.get('steps', [])]
+        requests = [s for s in steps if s['name'] == REQUEST_STEP]
+        if not requests or all(s.get('conclusion') == 'skipped' for s in requests):
+            # A skipped cooldown run must not erase an earlier retry deadline
+            # or conceal a request whose result was uncertain.
+            continue
+        if not all(s.get('conclusion') == 'success' for s in requests):
+            return False, 0
+        if (str(latest['id']) == REVIEWED_RATE_LIMIT_RUN
+                and latest.get('head_sha') == REVIEWED_RATE_LIMIT_HEAD
+                and latest.get('run_attempt') == 1
+                and latest.get('conclusion') == 'failure'
+                and any(s['name'] == 'Manual review required' and s.get('conclusion') == 'failure'
+                        for s in steps)):
+            return True, 0
+        for step in steps:
+            if step['name'] == RETRY_MARKER and step.get('conclusion') == 'success':
+                completed = step.get('completed_at')
+                # Both cron and local dispatch can queue a run. Enforce the
+                # ten-minute launch interval inside their shared workflow too.
+                deadline = math.ceil(datetime.fromisoformat(completed.replace('Z', '+00:00')).timestamp()) + 600 if completed else 0
+                return True, deadline
+        for step in steps:
+            if step['name'].startswith(RATE_LIMIT_MARKER) and step.get('conclusion') == 'success':
+                value = step['name'][len(RATE_LIMIT_MARKER):]
+                if value.isdigit() and int(value) > 0:
+                    return True, int(value)
+        return False, 0
+    # If the bounded history consists only of skipped requests, do not assume
+    # an older unresolved request or a long server cooldown has disappeared.
+    return len(runs) < 100, 0
+
+
+def previous_run_safe(runs, jobs, current_run):
+    return previous_run_state(runs, jobs, current_run)[0]
+
+
+def rate_limit_retry_at(headers, now=None):
+    now = time.time() if now is None else now
+    retry_at = now + RATE_LIMIT_COOLDOWN
+    value = next((str(v) for k, v in (headers or {}).items() if k.lower() == 'retry-after'), '')
+    try:
+        server_deadline = now + int(value) if value.isdigit() else parsedate_to_datetime(value).timestamp()
+        retry_at = max(retry_at, server_deadline)
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return math.ceil(retry_at)
 
 
 def load_config():
@@ -97,6 +146,20 @@ def all_items(method, *args, **kwargs):
 
 
 def check():
+    repo = os.environ.get('GITHUB_REPOSITORY')
+    if repo:
+        runs = github(f'repos/{repo}/actions/workflows/create-vm.yml/runs?per_page=100')['workflow_runs']
+        def jobs(run_id):
+            return github(f'repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100')['jobs']
+        safe, retry_at = previous_run_state(runs, jobs, os.environ['GITHUB_RUN_ID'])
+        if not safe:
+            summary('BLOCKED: A previous request may have been accepted. Stopping for manual review; no new request sent.')
+            output(status='blocked')
+            return
+        if time.time() < retry_at:
+            summary(f'COOLDOWN: Waiting for the next permitted attempt. No OCI request sent; retry after Unix time {retry_at}.')
+            output(status='cooldown')
+            return
     config = load_config()
     identity, compute, network, block = clients(config)
     root = config['tenancy']
@@ -141,15 +204,6 @@ def check():
     compatible = all_items(compute.list_image_shape_compatibility_entries, image.id)
     if SHAPE not in [entry.shape for entry in compatible]:
         raise ValueError('Image is not compatible with the selected free shape.')
-    repo = os.environ.get('GITHUB_REPOSITORY')
-    if repo:
-        runs = github(f'repos/{repo}/actions/workflows/create-vm.yml/runs?per_page=100')['workflow_runs']
-        def jobs(run_id):
-            return github(f'repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100')['jobs']
-        if not previous_run_safe(runs, jobs, os.environ['GITHUB_RUN_ID']):
-            summary('BLOCKED: A previous request may have been accepted. Stopping for manual review; no new request sent.')
-            output(status='blocked')
-            return
     summary('Preflight passed: home region, no existing ARM server, public subnet, compatible official Ubuntu image, storage within 200 GB. Target: ARM 2 OCPU / 12 GB RAM / 100 GB boot volume. Existing AMD is retained.')
     output(status='ready')
 
@@ -179,6 +233,10 @@ def launch():
         if error.status == 500 and 'out of host capacity' in error.message.lower():
             summary('CAPACITY_UNAVAILABLE: Oracle returned Out of host capacity. No instance accepted. The next scheduled run may retry.')
             output(status='capacity')
+        elif error.status == 429 and error.code == 'TooManyRequests':
+            retry_at = rate_limit_retry_at(error.headers)
+            summary(f'RATE_LIMITED: Oracle rejected the request (429 TooManyRequests). No instance accepted. Cool down for at least 30 minutes; retry after Unix time {retry_at}.')
+            output(status='rate_limited', retry_at=retry_at)
         else:
             summary(f'STOPPED: launch returned HTTP {error.status} ({error.code}). Review before any further request. No automatic retry.')
             output(status='uncertain')

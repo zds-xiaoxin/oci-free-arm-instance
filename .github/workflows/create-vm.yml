@@ -47,6 +47,9 @@ jobs:
       - name: 'Safe to retry: capacity unavailable'
         if: steps.request.outputs.status == 'capacity'
         run: echo 'Oracle has no free A1 host capacity. Retry permitted at next schedule.'
+      - name: 'Safe to retry: rate limited until ${{ steps.request.outputs.retry_at }}'
+        if: steps.request.outputs.status == 'rate_limited'
+        run: echo 'Oracle rejected the request. The next runs must honor the persisted cooldown.'
       - name: Stop automated attempts
         if: >-
           steps.request.outputs.status == 'accepted' ||
@@ -56,6 +59,11 @@ jobs:
         run: gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
       - name: Capacity unavailable
         if: steps.request.outputs.status == 'capacity'
+        run: exit 1
+      - name: Retry cooldown
+        if: >-
+          steps.request.outputs.status == 'rate_limited' ||
+          steps.check.outputs.status == 'cooldown'
         run: exit 1
       - name: Manual review required
         if: >-
